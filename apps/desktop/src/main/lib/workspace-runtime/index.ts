@@ -18,6 +18,7 @@ export {
 	getWorkspaceRuntimeRegistry,
 	resetWorkspaceRuntimeRegistry,
 } from "./registry";
+export { RemoteWorkspaceRuntime } from "./remote";
 export type {
 	TerminalCapabilities,
 	TerminalEventSource,

@@ -1,15 +1,20 @@
 import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { v4 as uuidv4 } from "uuid";
-
 import type {
 	BranchPrefixMode,
 	ExternalApp,
 	FileOpenMode,
 	GitHubStatus,
 	GitStatus,
+	RemoteWorkspaceTransport,
 	TerminalLinkBehavior,
 	TerminalPreset,
+	WorkspaceExecutionMode,
 	WorkspaceType,
+} from "./zod";
+import {
+	RemoteWorkspaceTransportEnum,
+	WorkspaceExecutionModeEnum,
 } from "./zod";
 
 /**
@@ -121,6 +126,22 @@ export const workspaces = sqliteTable(
 		// Allocated port base for multi-worktree dev instances.
 		// Each workspace gets a range of 10 ports starting from this base.
 		portBase: integer("port_base"),
+		// Execution mode for workspace terminals and runtime behavior.
+		executionMode: text("execution_mode")
+			.$type<WorkspaceExecutionMode>()
+			.notNull()
+			.default(WorkspaceExecutionModeEnum.Local),
+		// Remote workspace configuration (used when executionMode = "remote-ssh").
+		remoteHost: text("remote_host"),
+		remoteUser: text("remote_user"),
+		remotePort: integer("remote_port"),
+		remoteRepoPath: text("remote_repo_path"),
+		remoteTransport: text("remote_transport")
+			.$type<RemoteWorkspaceTransport>()
+			.default(RemoteWorkspaceTransportEnum.Ssh),
+		remoteUseSshfs: integer("remote_use_sshfs", { mode: "boolean" }).default(
+			false,
+		),
 	},
 	(table) => [
 		index("workspaces_project_id_idx").on(table.projectId),
