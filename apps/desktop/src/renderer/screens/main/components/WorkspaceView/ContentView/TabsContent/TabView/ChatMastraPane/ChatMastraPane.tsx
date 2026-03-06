@@ -1,31 +1,22 @@
 import { ChatServiceProvider } from "@superset/chat/client";
 import { ChatMastraServiceProvider } from "@superset/chat-mastra/client";
-import { toast } from "@superset/ui/sonner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@superset/ui/tooltip";
-import { eq } from "@tanstack/db";
-import { useLiveQuery } from "@tanstack/react-db";
 import { CopyIcon } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback } from "react";
 import type { MosaicBranch } from "react-mosaic-component";
 import { env } from "renderer/env.renderer";
-import { apiTrpcClient } from "renderer/lib/api-trpc-client";
-import { authClient, getAuthToken } from "renderer/lib/auth-client";
-import { electronTrpc } from "renderer/lib/electron-trpc";
-import { posthog } from "renderer/lib/posthog";
 import { electronQueryClient } from "renderer/providers/ElectronTRPCProvider";
-import { useCollections } from "renderer/routes/_authenticated/providers/CollectionsProvider";
 import { useTabsStore } from "renderer/stores/tabs/store";
-import type { Tab } from "renderer/stores/tabs/types";
+import type { SplitPaneOptions, Tab } from "renderer/stores/tabs/types";
 import { TabContentContextMenu } from "../../TabContentContextMenu";
 import { createChatServiceIpcClient } from "../ChatPane/utils/chat-service-client";
 import { BasePaneWindow, PaneToolbarActions } from "../components";
 import { ChatMastraInterface } from "./ChatMastraInterface";
-import type { ChatMastraRawSnapshot } from "./ChatMastraInterface/types";
 import { SessionSelector } from "./components/SessionSelector";
+import { useChatMastraPaneController } from "./hooks/useChatMastraPaneController";
+import { useChatMastraRawSnapshot } from "./hooks/useChatMastraRawSnapshot";
 import { createChatMastraServiceIpcClient } from "./utils/chat-mastra-service-client";
-import { reportChatMastraError } from "./utils/reportChatMastraError";
 
-const apiUrl = env.NEXT_PUBLIC_API_URL;
 const mastraIpcClient = createChatMastraServiceIpcClient();
 const chatIpcClient = createChatServiceIpcClient();
 
@@ -44,84 +35,19 @@ interface ChatMastraPaneProps {
 		tabId: string,
 		sourcePaneId: string,
 		path?: MosaicBranch[],
+		options?: SplitPaneOptions,
 	) => void;
 	splitPaneVertical: (
 		tabId: string,
 		sourcePaneId: string,
 		path?: MosaicBranch[],
+		options?: SplitPaneOptions,
 	) => void;
 	removePane: (paneId: string) => void;
 	setFocusedPane: (tabId: string, paneId: string) => void;
 	availableTabs: Tab[];
 	onMoveToTab: (targetTabId: string) => void;
 	onMoveToNewTab: () => void;
-}
-
-function toSessionSelectorItem(session: {
-	id: string;
-	title: string | null;
-	lastActiveAt: Date | string | null;
-	createdAt: Date | string;
-}) {
-	return {
-		sessionId: session.id,
-		title: session.title ?? "",
-		updatedAt:
-			session.lastActiveAt instanceof Date
-				? session.lastActiveAt
-				: session.lastActiveAt
-					? new Date(session.lastActiveAt)
-					: session.createdAt instanceof Date
-						? session.createdAt
-						: new Date(session.createdAt),
-	};
-}
-
-async function getHttpErrorDetail(response: Response): Promise<string> {
-	const errorBody = await response
-		.text()
-		.then((text) => text.trim())
-		.catch(() => "");
-	const statusText = response.statusText ? ` ${response.statusText}` : "";
-	const detail = errorBody ? ` - ${errorBody.slice(0, 500)}` : "";
-	return `${response.status}${statusText}${detail}`;
-}
-
-async function createSessionRecord(input: {
-	sessionId: string;
-	organizationId: string;
-	workspaceId: string;
-}): Promise<void> {
-	const token = getAuthToken();
-	const response = await fetch(`${apiUrl}/api/chat/${input.sessionId}`, {
-		method: "PUT",
-		headers: {
-			"Content-Type": "application/json",
-			...(token ? { Authorization: `Bearer ${token}` } : {}),
-		},
-		body: JSON.stringify({
-			organizationId: input.organizationId,
-			workspaceId: input.workspaceId,
-		}),
-	});
-
-	if (!response.ok) {
-		const detail = await getHttpErrorDetail(response);
-		throw new Error(`Failed to create session ${input.sessionId}: ${detail}`);
-	}
-}
-
-async function deleteSessionRecord(sessionId: string): Promise<void> {
-	const token = getAuthToken();
-	const response = await fetch(`${apiUrl}/api/chat/${sessionId}/stream`, {
-		method: "DELETE",
-		headers: token ? { Authorization: `Bearer ${token}` } : {},
-	});
-
-	if (!response.ok) {
-		const detail = await getHttpErrorDetail(response);
-		throw new Error(`Failed to delete session ${sessionId}: ${detail}`);
-	}
 }
 
 export function ChatMastraPane({
@@ -138,252 +64,70 @@ export function ChatMastraPane({
 	onMoveToTab,
 	onMoveToNewTab,
 }: ChatMastraPaneProps) {
-	const pane = useTabsStore((state) => state.panes[paneId]);
-	const switchChatMastraSession = useTabsStore(
-		(state) => state.switchChatMastraSession,
-	);
-	const sessionId = pane?.chatMastra?.sessionId ?? null;
-	const { data: session } = authClient.useSession();
-	const organizationId = session?.session?.activeOrganizationId ?? null;
-	const collections = useCollections();
-	const ensureSessionRef = useRef(false);
-	const ensuredRef = useRef<string | null>(null);
-	const rawSnapshotRef = useRef<ChatMastraRawSnapshot | null>(null);
-	const [rawSnapshotSessionId, setRawSnapshotSessionId] = useState<
-		string | null
-	>(null);
 	const showDevToolbarActions = env.NODE_ENV === "development";
+	const isFocused = useTabsStore((s) => s.focusedPaneIds[tabId] === paneId);
+	const paneName = useTabsStore((s) => s.panes[paneId]?.name ?? "New Chat");
+	const setTabAutoTitle = useTabsStore((s) => s.setTabAutoTitle);
+	const setPaneAutoTitle = useTabsStore((s) => s.setPaneAutoTitle);
+	const {
+		sessionId,
+		launchConfig,
+		organizationId,
+		workspacePath,
+		isSessionInitializing,
+		hasCurrentSessionRecord,
+		sessionItems,
+		handleSelectSession,
+		handleNewChat,
+		handleStartFreshSession,
+		handleDeleteSession,
+		ensureCurrentSessionRecord,
+		consumeLaunchConfig,
+	} = useChatMastraPaneController({
+		paneId,
+		workspaceId,
+	});
+	const {
+		snapshotAvailableForSession,
+		handleRawSnapshotChange,
+		handleCopyRawSnapshot,
+	} = useChatMastraRawSnapshot({ sessionId });
 
-	const { data: workspace } = electronTrpc.workspaces.get.useQuery(
-		{ id: workspaceId },
-		{ enabled: Boolean(workspaceId) },
-	);
+	const applySubmittedMessageFallbackTitle = useCallback(
+		(message: string) => {
+			const normalized = message.trim().replace(/\s+/g, " ");
+			if (!normalized) return;
+			const fallbackTitle =
+				normalized.length > 72
+					? `${normalized.slice(0, 69).trimEnd()}...`
+					: normalized;
 
-	const { data: remoteWorkspaces } = useLiveQuery(
-		(q) =>
-			q
-				.from({ ws: collections.workspaces })
-				.where(({ ws }) => eq(ws.id, workspaceId))
-				.select(({ ws }) => ({ id: ws.id })),
-		[collections.workspaces, workspaceId],
-	);
-	const existsRemotely = Boolean(
-		remoteWorkspaces && remoteWorkspaces.length > 0,
-	);
+			const state = useTabsStore.getState();
+			const pane = state.panes[paneId];
+			const tab = state.tabs.find((candidate) => candidate.id === tabId);
+			const tabPaneCount = Object.values(state.panes).filter(
+				(candidate) => candidate.tabId === tabId,
+			).length;
+			const paneName = pane?.name?.trim() ?? "";
+			const tabName = tab?.name?.trim() ?? "";
+			const hasCustomTabTitle = Boolean(tab?.userTitle?.trim());
+			const shouldSetPaneTitle =
+				paneName.length === 0 || paneName === "New Chat";
+			const shouldSetTabTitle =
+				!hasCustomTabTitle &&
+				(tabName.length === 0 ||
+					tabName === "New Chat" ||
+					(tabPaneCount === 1 && pane?.type === "chat-mastra"));
 
-	useEffect(() => {
-		if (existsRemotely) return;
-		if (!workspace?.project || !organizationId) return;
-		if (ensuredRef.current === workspaceId) return;
-
-		const project = workspace.project;
-		const repoName = project.mainRepoPath.split("/").pop();
-		if (!repoName || !project.githubOwner) return;
-
-		ensuredRef.current = workspaceId;
-
-		apiTrpcClient.workspace.ensure
-			.mutate({
-				organizationId,
-				project: {
-					name: project.name,
-					slug: repoName.toLowerCase(),
-					repoOwner: project.githubOwner,
-					repoName,
-					repoUrl: `https://github.com/${project.githubOwner}/${repoName}`,
-					defaultBranch: project.defaultBranch ?? "main",
-				},
-				workspace: {
-					id: workspaceId,
-					name: workspace.name,
-					type: "local",
-					config: {
-						path: workspace.worktreePath,
-						branch:
-							workspace.worktree?.branch ?? project.defaultBranch ?? "main",
-					},
-				},
-			})
-			.catch((error) => {
-				reportChatMastraError({
-					operation: "workspace.ensure",
-					error,
-					workspaceId,
-					paneId,
-					organizationId,
-				});
-				ensuredRef.current = null;
-			});
-	}, [existsRemotely, organizationId, paneId, workspace, workspaceId]);
-
-	const { data: sessionsData } = useLiveQuery(
-		(q) =>
-			q
-				.from({ chatSessions: collections.chatSessions })
-				.where(({ chatSessions }) => eq(chatSessions.workspaceId, workspaceId))
-				.orderBy(({ chatSessions }) => chatSessions.lastActiveAt, "desc")
-				.select(({ chatSessions }) => ({ ...chatSessions })),
-		[collections.chatSessions, workspaceId],
-	);
-	const sessions = sessionsData ?? [];
-
-	const handleSelectSession = useCallback(
-		(nextSessionId: string) => {
-			switchChatMastraSession(paneId, nextSessionId);
-			posthog.capture("chat_session_opened", {
-				workspace_id: workspaceId,
-				session_id: nextSessionId,
-				organization_id: organizationId,
-			});
-		},
-		[organizationId, paneId, switchChatMastraSession, workspaceId],
-	);
-
-	const handleNewChat = useCallback(async () => {
-		if (!organizationId) return;
-		const newSessionId = crypto.randomUUID();
-		try {
-			await createSessionRecord({
-				sessionId: newSessionId,
-				organizationId,
-				workspaceId,
-			});
-			switchChatMastraSession(paneId, newSessionId);
-			posthog.capture("chat_session_created", {
-				workspace_id: workspaceId,
-				session_id: newSessionId,
-				organization_id: organizationId,
-			});
-		} catch (error) {
-			reportChatMastraError({
-				operation: "session.create",
-				error,
-				sessionId: newSessionId,
-				workspaceId,
-				paneId,
-				organizationId,
-			});
-			toast.error("Failed to create session");
-		}
-	}, [organizationId, paneId, switchChatMastraSession, workspaceId]);
-
-	const handleStartFreshSession = useCallback(async () => {
-		if (!organizationId) {
-			return {
-				created: false as const,
-				errorMessage: "No active organization selected",
-			};
-		}
-
-		const newSessionId = crypto.randomUUID();
-		try {
-			await createSessionRecord({
-				sessionId: newSessionId,
-				organizationId,
-				workspaceId,
-			});
-			switchChatMastraSession(paneId, newSessionId);
-			posthog.capture("chat_session_created", {
-				workspace_id: workspaceId,
-				session_id: newSessionId,
-				organization_id: organizationId,
-			});
-			return { created: true as const };
-		} catch (error) {
-			reportChatMastraError({
-				operation: "session.create",
-				error,
-				sessionId: newSessionId,
-				workspaceId,
-				paneId,
-				organizationId,
-			});
-			return {
-				created: false as const,
-				errorMessage:
-					error instanceof Error
-						? error.message
-						: "Failed to create a new chat session",
-			};
-		}
-	}, [organizationId, paneId, switchChatMastraSession, workspaceId]);
-
-	const handleDeleteSession = useCallback(
-		async (sessionIdToDelete: string) => {
-			try {
-				await deleteSessionRecord(sessionIdToDelete);
-				posthog.capture("chat_session_deleted", {
-					workspace_id: workspaceId,
-					session_id: sessionIdToDelete,
-					organization_id: organizationId,
-				});
-				if (sessionIdToDelete === sessionId) {
-					switchChatMastraSession(paneId, null);
-				}
-			} catch (error) {
-				reportChatMastraError({
-					operation: "session.delete",
-					error,
-					sessionId: sessionIdToDelete,
-					workspaceId,
-					paneId,
-					organizationId,
-				});
-				throw error;
+			if (shouldSetPaneTitle) {
+				setPaneAutoTitle(paneId, fallbackTitle);
+			}
+			if (shouldSetTabTitle) {
+				setTabAutoTitle(tabId, fallbackTitle);
 			}
 		},
-		[organizationId, paneId, sessionId, switchChatMastraSession, workspaceId],
+		[paneId, setPaneAutoTitle, setTabAutoTitle, tabId],
 	);
-
-	useEffect(() => {
-		if (sessionId) return;
-		if (!organizationId) return;
-		if (ensureSessionRef.current) return;
-		ensureSessionRef.current = true;
-
-		void handleNewChat()
-			.catch(() => {})
-			.finally(() => {
-				ensureSessionRef.current = false;
-			});
-	}, [handleNewChat, organizationId, sessionId]);
-
-	const sessionItems = useMemo(
-		() => sessions.map((item) => toSessionSelectorItem(item)),
-		[sessions],
-	);
-
-	const handleRawSnapshotChange = useCallback(
-		(snapshot: ChatMastraRawSnapshot) => {
-			rawSnapshotRef.current = snapshot;
-			setRawSnapshotSessionId((previousSessionId) =>
-				previousSessionId === snapshot.sessionId
-					? previousSessionId
-					: snapshot.sessionId,
-			);
-		},
-		[],
-	);
-
-	const handleCopyRawSnapshot = useCallback(async () => {
-		const rawSnapshot = rawSnapshotRef.current;
-		if (!rawSnapshot || rawSnapshot.sessionId !== sessionId) {
-			toast.error("No raw chat data to copy yet");
-			return;
-		}
-
-		if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-			toast.error("Clipboard API is unavailable");
-			return;
-		}
-
-		try {
-			await navigator.clipboard.writeText(JSON.stringify(rawSnapshot, null, 2));
-			toast.success("Copied raw chat JSON");
-		} catch {
-			toast.error("Failed to copy raw chat JSON");
-		}
-	}, [sessionId]);
 
 	return (
 		<ChatMastraServiceProvider
@@ -403,10 +147,12 @@ export function ChatMastraPane({
 					setFocusedPane={setFocusedPane}
 					renderToolbar={(handlers) => (
 						<div className="flex h-full w-full items-center justify-between px-3">
-							<div className="flex min-w-0 items-center gap-2">
+							<div className="flex min-w-0 flex-1 items-center gap-2 pr-2">
 								<SessionSelector
 									currentSessionId={sessionId}
 									sessions={sessionItems}
+									fallbackTitle={paneName}
+									isSessionInitializing={isSessionInitializing}
 									onSelectSession={handleSelectSession}
 									onNewChat={handleNewChat}
 									onDeleteSession={handleDeleteSession}
@@ -425,10 +171,7 @@ export function ChatMastraPane({
 													onClick={() => {
 														void handleCopyRawSnapshot();
 													}}
-													disabled={
-														!rawSnapshotRef.current ||
-														rawSnapshotSessionId !== sessionId
-													}
+													disabled={!snapshotAvailableForSession}
 													className="rounded p-0.5 text-muted-foreground/60 transition-colors hover:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-40"
 												>
 													<CopyIcon className="size-3.5" />
@@ -448,6 +191,14 @@ export function ChatMastraPane({
 					<TabContentContextMenu
 						onSplitHorizontal={() => splitPaneHorizontal(tabId, paneId, path)}
 						onSplitVertical={() => splitPaneVertical(tabId, paneId, path)}
+						onSplitWithNewChat={() =>
+							splitPaneVertical(tabId, paneId, path, {
+								paneType: "chat-mastra",
+							})
+						}
+						onSplitWithNewBrowser={() =>
+							splitPaneVertical(tabId, paneId, path, { paneType: "webview" })
+						}
 						onClosePane={() => removePane(paneId)}
 						currentTabId={tabId}
 						availableTabs={availableTabs}
@@ -458,10 +209,16 @@ export function ChatMastraPane({
 						<div className="h-full w-full">
 							<ChatMastraInterface
 								sessionId={sessionId}
+								initialLaunchConfig={launchConfig}
 								workspaceId={workspaceId}
 								organizationId={organizationId}
-								cwd={workspace?.worktreePath ?? ""}
+								cwd={workspacePath}
+								isFocused={isFocused}
+								isSessionReady={hasCurrentSessionRecord}
+								ensureSessionReady={ensureCurrentSessionRecord}
 								onStartFreshSession={handleStartFreshSession}
+								onConsumeLaunchConfig={consumeLaunchConfig}
+								onUserMessageSubmitted={applySubmittedMessageFallbackTitle}
 								onRawSnapshotChange={
 									showDevToolbarActions ? handleRawSnapshotChange : undefined
 								}

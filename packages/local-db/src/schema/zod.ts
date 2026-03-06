@@ -137,6 +137,7 @@ export const EXTERNAL_APPS = [
 	"vscode-insiders",
 	"cursor",
 	"antigravity",
+	"windsurf",
 	"zed",
 	"sublime",
 	"xcode",

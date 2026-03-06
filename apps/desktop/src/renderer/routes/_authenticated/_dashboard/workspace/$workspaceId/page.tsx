@@ -1,4 +1,3 @@
-import { toast } from "@superset/ui/sonner";
 import { createFileRoute, notFound, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo } from "react";
 import { useFileOpenMode } from "renderer/hooks/useFileOpenMode";
@@ -19,7 +18,7 @@ import {
 } from "renderer/screens/main/components/KeywordSearch";
 import { WorkspaceInitializingView } from "renderer/screens/main/components/WorkspaceView/WorkspaceInitializingView";
 import { WorkspaceLayout } from "renderer/screens/main/components/WorkspaceView/WorkspaceLayout";
-import { usePRStatus } from "renderer/screens/main/hooks";
+import { useCreateOrOpenPR, usePRStatus } from "renderer/screens/main/hooks";
 import { useAppHotkey } from "renderer/stores/hotkeys";
 import { SidebarMode, useSidebarStore } from "renderer/stores/sidebar-state";
 import { getPaneDimensions } from "renderer/stores/tabs/pane-refs";
@@ -37,6 +36,8 @@ import {
 	useHasWorkspaceFailed,
 	useIsWorkspaceInitializing,
 } from "renderer/stores/workspace-init";
+
+const EMPTY_HISTORY_STACK: string[] = [];
 
 export const Route = createFileRoute(
 	"/_authenticated/_dashboard/workspace/$workspaceId/",
@@ -118,9 +119,12 @@ function WorkspacePage() {
 	const showInitView = isInitializing || hasFailed || hasIncompleteInit;
 
 	const allTabs = useTabsStore((s) => s.tabs);
-	const activeTabIds = useTabsStore((s) => s.activeTabIds);
-	const tabHistoryStacks = useTabsStore((s) => s.tabHistoryStacks);
-	const focusedPaneIds = useTabsStore((s) => s.focusedPaneIds);
+	const activeTabIdForWorkspace = useTabsStore(
+		(s) => s.activeTabIds[workspaceId] ?? null,
+	);
+	const tabHistoryStack = useTabsStore(
+		(s) => s.tabHistoryStacks[workspaceId] ?? EMPTY_HISTORY_STACK,
+	);
 	const {
 		addTab,
 		splitPaneAuto,
@@ -150,17 +154,19 @@ function WorkspacePage() {
 		return resolveActiveTabIdForWorkspace({
 			workspaceId,
 			tabs,
-			activeTabIds,
-			tabHistoryStacks,
+			activeTabIds: { [workspaceId]: activeTabIdForWorkspace },
+			tabHistoryStacks: { [workspaceId]: tabHistoryStack },
 		});
-	}, [workspaceId, tabs, activeTabIds, tabHistoryStacks]);
+	}, [workspaceId, tabs, activeTabIdForWorkspace, tabHistoryStack]);
 
 	const activeTab = useMemo(
 		() => (activeTabId ? tabs.find((t) => t.id === activeTabId) : null),
 		[activeTabId, tabs],
 	);
 
-	const focusedPaneId = activeTabId ? focusedPaneIds[activeTabId] : null;
+	const focusedPaneId = useTabsStore((s) =>
+		activeTabId ? (s.focusedPaneIds[activeTabId] ?? null) : null,
+	);
 
 	const { presets } = usePresets();
 
@@ -324,27 +330,24 @@ function WorkspacePage() {
 		{ enabled: !!projectId },
 	);
 	const utils = electronTrpc.useUtils();
-	const openInApp = electronTrpc.external.openInApp.useMutation({
-		onSuccess: () => {
-			if (projectId) {
-				utils.projects.getDefaultApp.invalidate({ projectId });
-			}
-		},
-	});
-	useAppHotkey(
-		"OPEN_IN_APP",
-		() => {
-			if (workspace?.worktreePath && defaultApp) {
-				openInApp.mutate({
-					path: workspace.worktreePath,
-					app: defaultApp,
-					projectId,
-				});
-			}
-		},
-		undefined,
-		[workspace?.worktreePath, defaultApp, projectId],
-	);
+	const { mutate: mutateOpenInApp } =
+		electronTrpc.external.openInApp.useMutation({
+			onSuccess: () => {
+				if (projectId) {
+					utils.projects.getDefaultApp.invalidate({ projectId });
+				}
+			},
+		});
+	const handleOpenInApp = useCallback(() => {
+		if (workspace?.worktreePath && defaultApp) {
+			mutateOpenInApp({
+				path: workspace.worktreePath,
+				app: defaultApp,
+				projectId,
+			});
+		}
+	}, [workspace?.worktreePath, defaultApp, mutateOpenInApp, projectId]);
+	useAppHotkey("OPEN_IN_APP", handleOpenInApp, undefined, [handleOpenInApp]);
 
 	// Copy path shortcut
 	const copyPath = electronTrpc.external.copyPath.useMutation();
@@ -361,21 +364,20 @@ function WorkspacePage() {
 
 	// Open PR shortcut (⌘⇧P)
 	const { pr } = usePRStatus({ workspaceId });
-	const createPRMutation = electronTrpc.changes.createPR.useMutation({
-		onSuccess: () => toast.success("Opening GitHub..."),
-		onError: (error) => toast.error(`Failed: ${error.message}`),
+	const { createOrOpenPR } = useCreateOrOpenPR({
+		worktreePath: workspace?.worktreePath,
 	});
 	useAppHotkey(
 		"OPEN_PR",
 		() => {
 			if (pr?.url) {
 				window.open(pr.url, "_blank");
-			} else if (workspace?.worktreePath) {
-				createPRMutation.mutate({ worktreePath: workspace.worktreePath });
+			} else {
+				createOrOpenPR();
 			}
 		},
 		undefined,
-		[pr?.url, workspace?.worktreePath],
+		[pr?.url, createOrOpenPR],
 	);
 
 	const commandPalette = useCommandPalette({
@@ -386,24 +388,18 @@ function WorkspacePage() {
 		workspaceId,
 		worktreePath: workspace?.worktreePath,
 	});
-	useAppHotkey(
-		"QUICK_OPEN",
-		() => {
-			keywordSearch.handleOpenChange(false);
-			commandPalette.toggle();
-		},
-		undefined,
-		[commandPalette.toggle, keywordSearch.handleOpenChange],
-	);
-	useAppHotkey(
-		"KEYWORD_SEARCH",
-		() => {
-			commandPalette.handleOpenChange(false);
-			keywordSearch.toggle();
-		},
-		undefined,
-		[commandPalette.handleOpenChange, keywordSearch.toggle],
-	);
+	const handleQuickOpen = useCallback(() => {
+		keywordSearch.handleOpenChange(false);
+		commandPalette.toggle();
+	}, [commandPalette.toggle, keywordSearch.handleOpenChange]);
+	const handleKeywordSearch = useCallback(() => {
+		commandPalette.handleOpenChange(false);
+		keywordSearch.toggle();
+	}, [commandPalette.handleOpenChange, keywordSearch.toggle]);
+	useAppHotkey("QUICK_OPEN", handleQuickOpen, undefined, [handleQuickOpen]);
+	useAppHotkey("KEYWORD_SEARCH", handleKeywordSearch, undefined, [
+		handleKeywordSearch,
+	]);
 
 	// Toggle changes sidebar (⌘L)
 	useAppHotkey("TOGGLE_SIDEBAR", () => toggleSidebar(), undefined, [
@@ -507,6 +503,56 @@ function WorkspacePage() {
 		],
 	);
 
+	useAppHotkey(
+		"SPLIT_WITH_CHAT",
+		() => {
+			if (activeTabId && focusedPaneId && activeTab) {
+				const target = resolveSplitTarget(
+					focusedPaneId,
+					activeTabId,
+					activeTab,
+				);
+				if (!target) return;
+				splitPaneVertical(activeTabId, target.paneId, target.path, {
+					paneType: "chat-mastra",
+				});
+			}
+		},
+		undefined,
+		[
+			activeTabId,
+			focusedPaneId,
+			activeTab,
+			splitPaneVertical,
+			resolveSplitTarget,
+		],
+	);
+
+	useAppHotkey(
+		"SPLIT_WITH_BROWSER",
+		() => {
+			if (activeTabId && focusedPaneId && activeTab) {
+				const target = resolveSplitTarget(
+					focusedPaneId,
+					activeTabId,
+					activeTab,
+				);
+				if (!target) return;
+				splitPaneVertical(activeTabId, target.paneId, target.path, {
+					paneType: "webview",
+				});
+			}
+		},
+		undefined,
+		[
+			activeTabId,
+			focusedPaneId,
+			activeTab,
+			splitPaneVertical,
+			resolveSplitTarget,
+		],
+	);
+
 	// Navigate to previous workspace (⌘↑)
 	const getPreviousWorkspace =
 		electronTrpc.workspaces.getPreviousWorkspace.useQuery(
@@ -552,7 +598,11 @@ function WorkspacePage() {
 						isInterrupted={hasIncompleteInit && !isInitializing}
 					/>
 				) : (
-					<WorkspaceLayout />
+					<WorkspaceLayout
+						defaultExternalApp={defaultApp}
+						onOpenInApp={handleOpenInApp}
+						onOpenQuickOpen={handleQuickOpen}
+					/>
 				)}
 			</div>
 			<CommandPalette

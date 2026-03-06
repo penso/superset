@@ -129,6 +129,7 @@ export interface Pane {
 	tabId: string;
 	type: PaneType;
 	name: string;
+	userTitle?: string;
 	isNew?: boolean;
 	status?: PaneStatus;
 	initialCwd?: string;
@@ -141,8 +142,17 @@ export interface Pane {
 	devtools?: DevToolsPaneState; // For devtools panes
 }
 
+export interface ChatMastraLaunchConfig {
+	initialPrompt?: string;
+	metadata?: {
+		model?: string;
+	};
+	retryCount?: number;
+}
+
 export interface ChatMastraPaneState {
 	sessionId: string | null;
+	launchConfig?: ChatMastraLaunchConfig | null;
 }
 
 /**

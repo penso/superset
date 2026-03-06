@@ -1,11 +1,14 @@
 import { chatServiceTrpc } from "@superset/chat/client";
 import {
 	chatMastraServiceTrpc,
+	type UseMastraChatDisplayReturn,
 	useMastraChatDisplay,
 } from "@superset/chat-mastra/client";
 import {
+	PromptInputAttachment,
 	type PromptInputMessage,
 	PromptInputProvider,
+	useProviderAttachments,
 } from "@superset/ui/ai-elements/prompt-input";
 import { useQuery } from "@tanstack/react-query";
 import type { ChatStatus } from "ai";
@@ -13,6 +16,7 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiTrpcClient } from "renderer/lib/api-trpc-client";
 import { posthog } from "renderer/lib/posthog";
+import { useChatPreferencesStore } from "renderer/stores/chat-preferences";
 import { ChatInputFooter } from "../../ChatPane/ChatInterface/components/ChatInputFooter";
 import { useSlashCommandExecutor } from "../../ChatPane/ChatInterface/hooks/useSlashCommandExecutor";
 import type { SlashCommand } from "../../ChatPane/ChatInterface/hooks/useSlashCommands";
@@ -23,8 +27,98 @@ import type {
 import { ChatMastraMessageList } from "./components/ChatMastraMessageList";
 import { McpControls } from "./components/McpControls";
 import { useMcpUi } from "./hooks/useMcpUi";
+import { useOptimisticUpload } from "./hooks/useOptimisticUpload";
 import type { ChatMastraInterfaceProps } from "./types";
-import { toMastraImages } from "./utils/toMastraImages";
+import {
+	hasMatchingUserMessage,
+	type MastraHistoryMessage,
+	toOptimisticUserMessage,
+} from "./utils/optimisticUserMessage";
+import {
+	type ChatSendMessageInput,
+	sendMessageForSession,
+	toSendFailureMessage,
+} from "./utils/sendMessage";
+import { uploadFiles } from "./utils/uploadFiles";
+
+type HarnessFilePayload = {
+	data: string;
+	mediaType: string;
+	filename?: string;
+	uploaded?: boolean;
+};
+
+function MastraUploadFooter({
+	sessionId,
+	onError,
+	onSend,
+	...footerProps
+}: {
+	sessionId: string | null;
+	onError: (message: string) => void;
+	onSend: (payload: {
+		content: string;
+		files?: HarnessFilePayload[];
+	}) => void | Promise<void>;
+} & Omit<React.ComponentProps<typeof ChatInputFooter>, "onSend">) {
+	const attachments = useProviderAttachments();
+	const { entries, getUploadedFiles, isUploading } = useOptimisticUpload({
+		sessionId,
+		attachmentFiles: attachments.files,
+		removeAttachment: attachments.remove,
+		onError,
+	});
+
+	const handleSend = useCallback(
+		(message: PromptInputMessage) => {
+			const files = sessionId
+				? (() => {
+						const { files: uploadedFiles, ready } = getUploadedFiles();
+						if (!ready) return null;
+						return uploadedFiles.map((file) => ({
+							data: file.url,
+							mediaType: file.mediaType,
+							filename: file.filename,
+							uploaded: true,
+						}));
+					})()
+				: (message.files ?? []).map((file) => ({
+						data: file.url,
+						mediaType: file.mediaType,
+						filename: file.filename,
+						uploaded: false,
+					}));
+			if (files === null) return;
+
+			return onSend({
+				content: message.text,
+				files: files.length > 0 ? files : undefined,
+			});
+		},
+		[getUploadedFiles, onSend, sessionId],
+	);
+
+	const renderAttachment = useCallback(
+		(file: { id: string; type: "file"; url: string; mediaType: string }) => {
+			if (!sessionId) {
+				return <PromptInputAttachment data={file} />;
+			}
+			const entry = entries.get(file.id);
+			const loading = entry?.uploading ?? !entries.has(file.id);
+			return <PromptInputAttachment data={file} loading={loading} />;
+		},
+		[entries, sessionId],
+	);
+
+	return (
+		<ChatInputFooter
+			{...footerProps}
+			submitDisabled={sessionId ? isUploading : false}
+			renderAttachment={renderAttachment}
+			onSend={handleSend}
+		/>
+	);
+}
 
 function useAvailableModels(): {
 	models: ModelOption[];
@@ -46,16 +140,67 @@ function toErrorMessage(error: unknown): string | null {
 	return "Unknown chat error";
 }
 
+const AUTO_LAUNCH_MAX_RETRIES = 3;
+const AUTO_LAUNCH_RETRY_DELAY_MS = 1500;
+
+type MastraMessage = NonNullable<
+	UseMastraChatDisplayReturn["messages"]
+>[number];
+
+type InterruptedMessage = {
+	id: string;
+	sourceMessageId: string;
+	content: MastraMessage["content"];
+};
+
+type ChatAnalyticsProperties = Record<string, unknown>;
+
+function cloneMessageContent(
+	content: MastraMessage["content"],
+): MastraMessage["content"] {
+	if (typeof structuredClone === "function") {
+		return structuredClone(content);
+	}
+	try {
+		return JSON.parse(JSON.stringify(content)) as MastraMessage["content"];
+	} catch {
+		return content.map((part) => ({ ...part }));
+	}
+}
+
+function getLaunchConfigKey(
+	config: NonNullable<ChatMastraInterfaceProps["initialLaunchConfig"]>,
+): string {
+	return JSON.stringify({
+		initialPrompt: config.initialPrompt ?? null,
+		model: config.metadata?.model ?? null,
+		retryCount: config.retryCount ?? null,
+	});
+}
+
 export function ChatMastraInterface({
 	sessionId,
+	initialLaunchConfig,
 	workspaceId,
 	organizationId,
 	cwd,
+	isFocused,
+	isSessionReady,
+	ensureSessionReady,
 	onStartFreshSession,
+	onConsumeLaunchConfig,
+	onUserMessageSubmitted,
 	onRawSnapshotChange,
 }: ChatMastraInterfaceProps) {
 	const { models: availableModels, defaultModel } = useAvailableModels();
-	const [selectedModel, setSelectedModel] = useState<ModelOption | null>(null);
+	const selectedModelId = useChatPreferencesStore(
+		(state) => state.selectedModelId,
+	);
+	const setSelectedModelId = useChatPreferencesStore(
+		(state) => state.setSelectedModelId,
+	);
+	const selectedModel =
+		availableModels.find((model) => model.id === selectedModelId) ?? null;
 	const activeModel = selectedModel ?? defaultModel;
 	const [modelSelectorOpen, setModelSelectorOpen] = useState(false);
 	const [thinkingEnabled, setThinkingEnabled] = useState(false);
@@ -65,10 +210,36 @@ export function ChatMastraInterface({
 		undefined,
 	);
 	const [runtimeError, setRuntimeError] = useState<string | null>(null);
+	const [interruptedMessage, setInterruptedMessage] =
+		useState<InterruptedMessage | null>(null);
+	const [pendingImmediateUserMessage, setPendingImmediateUserMessage] =
+		useState<MastraHistoryMessage | null>(null);
+	const [approvalResponsePending, setApprovalResponsePending] = useState(false);
+	const [planResponsePending, setPlanResponsePending] = useState(false);
+	const [questionResponsePending, setQuestionResponsePending] = useState(false);
 	const currentMcpScopeRef = useRef<string | null>(null);
+	const consumedLaunchConfigRef = useRef<string | null>(null);
+	const autoLaunchInFlightRef = useRef<string | null>(null);
+	const autoLaunchAttemptsRef = useRef<Record<string, number>>({});
+	const autoLaunchSessionLockRef = useRef<Record<string, string | null>>({});
+	const messagesLengthRef = useRef(0);
+	const autoLaunchRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+		null,
+	);
 	const chatMastraServiceTrpcUtils = chatMastraServiceTrpc.useUtils();
 	const authenticateMcpServerMutation =
 		chatMastraServiceTrpc.workspace.authenticateMcpServer.useMutation();
+	const captureChatEvent = useCallback(
+		(event: string, properties?: ChatAnalyticsProperties) => {
+			posthog.capture(event, {
+				workspace_id: workspaceId,
+				session_id: sessionId,
+				organization_id: organizationId,
+				...properties,
+			});
+		},
+		[organizationId, sessionId, workspaceId],
+	);
 
 	const { data: slashCommands = [] } =
 		chatServiceTrpc.workspace.getSlashCommands.useQuery(
@@ -87,9 +258,14 @@ export function ChatMastraInterface({
 		messages,
 		currentMessage,
 		isRunning = false,
+		isConversationLoading = false,
 		error = null,
 		activeTools,
 		toolInputBuffers,
+		activeSubagents,
+		pendingApproval = null,
+		pendingPlanApproval = null,
+		pendingQuestion = null,
 	} = chat;
 
 	const clearRuntimeError = useCallback(() => {
@@ -102,19 +278,56 @@ export function ChatMastraInterface({
 
 	const handleSelectModel = useCallback(
 		(model: React.SetStateAction<ModelOption | null>) => {
-			setSelectedModel(model);
-			if (typeof model === "object" && model !== null) {
-				posthog.capture("chat_model_changed", {
-					workspace_id: workspaceId,
-					session_id: sessionId,
-					organization_id: organizationId,
-					model_id: model.id,
-					model_name: model.name,
-					trigger: "picker",
+			const nextSelectedModel =
+				typeof model === "function" ? model(selectedModel) : model;
+			if (!nextSelectedModel) {
+				setSelectedModelId(null);
+				return;
+			}
+			captureChatEvent("chat_model_changed", {
+				model_id: nextSelectedModel.id,
+				model_name: nextSelectedModel.name,
+				trigger: "picker",
+			});
+			setSelectedModelId(nextSelectedModel.id);
+		},
+		[captureChatEvent, selectedModel, setSelectedModelId],
+	);
+
+	const sendMessageToSession = useCallback(
+		async (targetSessionId: string, input: ChatSendMessageInput) => {
+			const queryInput = {
+				sessionId: targetSessionId,
+				...(cwd ? { cwd } : {}),
+			};
+			const optimisticMessage = toOptimisticUserMessage(input);
+			if (optimisticMessage) {
+				chatMastraServiceTrpcUtils.session.listMessages.setData(
+					queryInput,
+					(existingMessages = []) => [...existingMessages, optimisticMessage],
+				);
+			}
+
+			try {
+				await chatMastraServiceTrpcUtils.client.session.sendMessage.mutate({
+					sessionId: targetSessionId,
+					...(cwd ? { cwd } : {}),
+					...input,
 				});
+			} catch (error) {
+				if (optimisticMessage) {
+					chatMastraServiceTrpcUtils.session.listMessages.setData(
+						queryInput,
+						(existingMessages = []) =>
+							existingMessages.filter(
+								(message) => message.id !== optimisticMessage.id,
+							),
+					);
+				}
+				throw error;
 			}
 		},
-		[organizationId, sessionId, workspaceId],
+		[chatMastraServiceTrpcUtils, cwd],
 	);
 
 	const canAbort = Boolean(isRunning);
@@ -151,17 +364,49 @@ export function ChatMastraInterface({
 		authenticateServer: authenticateMcpServer,
 		onSetErrorMessage: setRuntimeErrorMessage,
 		onClearError: clearRuntimeError,
-		onTrackEvent: (event, properties) => {
-			posthog.capture(event, {
-				workspace_id: workspaceId,
-				session_id: sessionId,
-				organization_id: organizationId,
-				...properties,
-			});
-		},
+		onTrackEvent: captureChatEvent,
 	});
 	const resetMcpUi = mcpUi.resetUi;
 	const refreshMcpOverview = mcpUi.refreshOverview;
+
+	const captureInterruptedMessage =
+		useCallback((): InterruptedMessage | null => {
+			if (!isRunning) return null;
+			if (!currentMessage || currentMessage.role !== "assistant") return null;
+			if (currentMessage.content.length === 0) return null;
+			return {
+				id: `interrupted:${currentMessage.id}`,
+				sourceMessageId: currentMessage.id,
+				content: cloneMessageContent(currentMessage.content),
+			};
+		}, [currentMessage, isRunning]);
+
+	const stopActiveResponse = useCallback(async () => {
+		clearRuntimeError();
+		const snapshot = captureInterruptedMessage();
+		try {
+			await commands.stop();
+		} catch (error) {
+			setInterruptedMessage(null);
+			setRuntimeErrorMessage(
+				toErrorMessage(error) ?? "Failed to stop response",
+			);
+			return;
+		}
+		if (snapshot) {
+			setInterruptedMessage(snapshot);
+		}
+		captureChatEvent("chat_turn_aborted", {
+			model_id: activeModel?.id ?? null,
+		});
+	}, [
+		activeModel?.id,
+		captureChatEvent,
+		captureInterruptedMessage,
+		clearRuntimeError,
+		commands,
+		setRuntimeErrorMessage,
+	]);
 
 	const { resolveSlashCommandInput } = useSlashCommandExecutor({
 		cwd,
@@ -169,7 +414,7 @@ export function ChatMastraInterface({
 		canAbort,
 		onStartFreshSession,
 		onStopActiveResponse: () => {
-			void commands.stop();
+			void stopActiveResponse();
 		},
 		onSelectModel: handleSelectModel,
 		onOpenModelPicker: () => setModelSelectorOpen(true),
@@ -177,14 +422,7 @@ export function ChatMastraInterface({
 		onClearError: clearRuntimeError,
 		onShowMcpOverview: mcpUi.showOverview,
 		loadMcpOverview,
-		onTrackEvent: (event, properties) => {
-			posthog.capture(event, {
-				workspace_id: workspaceId,
-				session_id: sessionId,
-				organization_id: organizationId,
-				...properties,
-			});
-		},
+		onTrackEvent: captureChatEvent,
 	});
 
 	useEffect(() => {
@@ -193,11 +431,38 @@ export function ChatMastraInterface({
 		currentMcpScopeRef.current = scopeKey;
 		setSubmitStatus(undefined);
 		setRuntimeError(null);
+		setInterruptedMessage(null);
+		setPendingImmediateUserMessage(null);
 		resetMcpUi();
 		if (sessionId) {
 			void refreshMcpOverview();
 		}
 	}, [cwd, refreshMcpOverview, resetMcpUi, sessionId]);
+
+	useEffect(() => {
+		if (!pendingImmediateUserMessage) return;
+		if (
+			hasMatchingUserMessage({
+				messages,
+				candidate: pendingImmediateUserMessage,
+			})
+		) {
+			setPendingImmediateUserMessage(null);
+		}
+	}, [messages, pendingImmediateUserMessage]);
+
+	const visibleMessages = useMemo(() => {
+		if (!pendingImmediateUserMessage) return messages;
+		if (
+			hasMatchingUserMessage({
+				messages,
+				candidate: pendingImmediateUserMessage,
+			})
+		) {
+			return messages;
+		}
+		return [...messages, pendingImmediateUserMessage];
+	}, [messages, pendingImmediateUserMessage]);
 
 	useEffect(() => {
 		if (isRunning) {
@@ -228,110 +493,388 @@ export function ChatMastraInterface({
 		sessionId,
 	]);
 
-	const handleSend = useCallback(
-		async (message: PromptInputMessage) => {
-			let text = message.text.trim();
-			const files = (message.files ?? []).map((file) => ({
-				url: file.url,
-				mediaType: file.mediaType,
-				filename: file.filename,
-			}));
+	useEffect(() => {
+		messagesLengthRef.current = messages?.length ?? 0;
+	}, [messages]);
 
-			const isSlashCommand = text.startsWith("/");
-			const slashCommandResult = await resolveSlashCommandInput(text);
+	const handleSend = useCallback(
+		async (payload: { content: string; files?: HarnessFilePayload[] }) => {
+			let content = payload.content.trim();
+
+			const isSlashCommand = content.startsWith("/");
+			const slashCommandResult = await resolveSlashCommandInput(content);
 			if (slashCommandResult.handled) {
+				setSubmitStatus(undefined);
 				return;
 			}
-			text = slashCommandResult.nextText.trim();
+			content = slashCommandResult.nextText.trim();
 
-			const images = toMastraImages(files);
-			if (!text && images.length === 0) return;
+			if (!content && (!payload.files || payload.files.length === 0)) {
+				setSubmitStatus(undefined);
+				return;
+			}
+			setInterruptedMessage(null);
 			setSubmitStatus("submitted");
 			clearRuntimeError();
 
-			await commands.sendMessage({
+			let preparedFiles = payload.files;
+			let effectiveSessionId = sessionId;
+
+			if (preparedFiles?.some((file) => file.uploaded === false)) {
+				if (!effectiveSessionId) {
+					const startResult = await onStartFreshSession();
+					if (!startResult.created || !startResult.sessionId) {
+						throw new Error(
+							startResult.errorMessage ??
+								"Failed to create a chat session. Please retry.",
+						);
+					}
+					effectiveSessionId = startResult.sessionId;
+				}
+
+				const uploadedFiles = await uploadFiles(
+					effectiveSessionId,
+					preparedFiles.map((file) => ({
+						type: "file",
+						url: file.data,
+						mediaType: file.mediaType,
+						filename: file.filename,
+					})),
+				);
+				preparedFiles = uploadedFiles.map((file) => ({
+					data: file.url,
+					mediaType: file.mediaType,
+					filename: file.filename,
+					uploaded: true,
+				}));
+			}
+
+			const sendInput: ChatSendMessageInput = {
 				payload: {
-					content: text || "",
-					...(images.length > 0 ? { images } : {}),
+					content,
+					...(preparedFiles?.length
+						? {
+								files: preparedFiles.map(({ data, filename, mediaType }) => ({
+									data,
+									mediaType,
+									filename,
+								})),
+							}
+						: {}),
 				},
 				metadata: {
 					model: activeModel?.id,
 				},
-			});
+			};
+			const immediateUserMessage =
+				effectiveSessionId && !isSessionReady
+					? toOptimisticUserMessage(sendInput)
+					: null;
+			if (immediateUserMessage) {
+				setPendingImmediateUserMessage(immediateUserMessage);
+			}
 
-			posthog.capture("chat_message_sent", {
-				workspace_id: workspaceId,
-				session_id: sessionId,
-				organization_id: organizationId,
+			let targetSessionId = effectiveSessionId;
+			try {
+				const sendResult =
+					effectiveSessionId && effectiveSessionId !== sessionId
+						? {
+								targetSessionId: effectiveSessionId,
+								value: await sendMessageToSession(
+									effectiveSessionId,
+									sendInput,
+								),
+							}
+						: await sendMessageForSession({
+								currentSessionId: effectiveSessionId,
+								isSessionReady,
+								ensureSessionReady,
+								onStartFreshSession,
+								sendToCurrentSession: () => commands.sendMessage(sendInput),
+								sendToSession: (nextSessionId) =>
+									sendMessageToSession(nextSessionId, sendInput),
+							});
+				targetSessionId = sendResult.targetSessionId;
+				if (content) {
+					onUserMessageSubmitted?.(content);
+				}
+			} catch (error) {
+				const sendErrorMessage = toSendFailureMessage(error);
+				setSubmitStatus(undefined);
+				setRuntimeErrorMessage(sendErrorMessage);
+				if (immediateUserMessage) {
+					setPendingImmediateUserMessage((previousMessage) =>
+						previousMessage?.id === immediateUserMessage.id
+							? null
+							: previousMessage,
+					);
+				}
+				if (error instanceof Error) throw error;
+				throw new Error(sendErrorMessage);
+			}
+
+			captureChatEvent("chat_message_sent", {
+				session_id: targetSessionId,
 				model_id: activeModel?.id ?? null,
 				mention_count: 0,
-				attachment_count: files.length,
+				attachment_count: payload.files?.length ?? 0,
 				is_slash_command: isSlashCommand,
-				message_length: text.length,
+				message_length: content.length,
 				turn_number: (messages?.length ?? 0) + 1,
 			});
 		},
 		[
 			activeModel?.id,
+			captureChatEvent,
 			clearRuntimeError,
 			commands,
+			isSessionReady,
 			messages?.length,
-			organizationId,
+			onStartFreshSession,
 			resolveSlashCommandInput,
+			ensureSessionReady,
 			sessionId,
-			workspaceId,
+			sendMessageToSession,
+			setRuntimeErrorMessage,
+			onUserMessageSubmitted,
 		],
 	);
+
+	useEffect(() => {
+		if (!initialLaunchConfig) return;
+
+		const launchConfigKey = getLaunchConfigKey(initialLaunchConfig);
+		const attemptAutoLaunch = async (): Promise<void> => {
+			if (consumedLaunchConfigRef.current === launchConfigKey) return;
+			if (autoLaunchInFlightRef.current === launchConfigKey) return;
+
+			const prompt = initialLaunchConfig.initialPrompt?.trim();
+			if (!prompt) {
+				consumedLaunchConfigRef.current = launchConfigKey;
+				delete autoLaunchAttemptsRef.current[launchConfigKey];
+				delete autoLaunchSessionLockRef.current[launchConfigKey];
+				onConsumeLaunchConfig();
+				return;
+			}
+
+			const currentSessionKey = sessionId ?? null;
+			const lockedSession = autoLaunchSessionLockRef.current[launchConfigKey];
+			if (lockedSession === undefined) {
+				autoLaunchSessionLockRef.current[launchConfigKey] = currentSessionKey;
+			} else if (lockedSession !== currentSessionKey) {
+				// Don't send launch retries into a different user-selected session.
+				return;
+			}
+
+			const previousAttempts =
+				autoLaunchAttemptsRef.current[launchConfigKey] ?? 0;
+			const retryLimit =
+				initialLaunchConfig.retryCount ?? AUTO_LAUNCH_MAX_RETRIES;
+			if (previousAttempts >= retryLimit) return;
+
+			autoLaunchAttemptsRef.current[launchConfigKey] = previousAttempts + 1;
+			autoLaunchInFlightRef.current = launchConfigKey;
+			if (autoLaunchRetryTimerRef.current) {
+				clearTimeout(autoLaunchRetryTimerRef.current);
+				autoLaunchRetryTimerRef.current = null;
+			}
+
+			clearRuntimeError();
+			setSubmitStatus("submitted");
+
+			const modelId = initialLaunchConfig.metadata?.model ?? activeModel?.id;
+			const sendInput: ChatSendMessageInput = {
+				payload: {
+					content: prompt,
+				},
+				metadata: {
+					model: modelId,
+				},
+			};
+
+			try {
+				const sendResult = await sendMessageForSession({
+					currentSessionId: autoLaunchSessionLockRef.current[launchConfigKey],
+					isSessionReady,
+					ensureSessionReady,
+					onStartFreshSession,
+					sendToCurrentSession: () => commands.sendMessage(sendInput),
+					sendToSession: (nextSessionId) =>
+						sendMessageToSession(nextSessionId, sendInput),
+				});
+				onUserMessageSubmitted?.(prompt);
+
+				autoLaunchInFlightRef.current = null;
+				consumedLaunchConfigRef.current = launchConfigKey;
+				delete autoLaunchAttemptsRef.current[launchConfigKey];
+				delete autoLaunchSessionLockRef.current[launchConfigKey];
+				onConsumeLaunchConfig();
+
+				captureChatEvent("chat_message_sent", {
+					session_id: sendResult.targetSessionId,
+					model_id: modelId ?? null,
+					mention_count: 0,
+					attachment_count: 0,
+					is_slash_command: false,
+					message_length: prompt.length,
+					turn_number: messagesLengthRef.current + 1,
+					send_trigger: "launch-config",
+				});
+			} catch (error) {
+				autoLaunchInFlightRef.current = null;
+
+				const sendErrorMessage = toSendFailureMessage(error);
+				setSubmitStatus(undefined);
+				setRuntimeErrorMessage(sendErrorMessage);
+				console.debug("[chat-mastra] auto launch send failed", error);
+
+				const currentAttempts =
+					autoLaunchAttemptsRef.current[launchConfigKey] ??
+					previousAttempts + 1;
+				if (currentAttempts < retryLimit) {
+					autoLaunchRetryTimerRef.current = setTimeout(() => {
+						void attemptAutoLaunch();
+					}, AUTO_LAUNCH_RETRY_DELAY_MS);
+				}
+			}
+		};
+		void attemptAutoLaunch();
+
+		return () => {
+			if (autoLaunchRetryTimerRef.current) {
+				clearTimeout(autoLaunchRetryTimerRef.current);
+				autoLaunchRetryTimerRef.current = null;
+			}
+		};
+	}, [
+		activeModel?.id,
+		captureChatEvent,
+		clearRuntimeError,
+		commands,
+		ensureSessionReady,
+		initialLaunchConfig,
+		isSessionReady,
+		onConsumeLaunchConfig,
+		onStartFreshSession,
+		sendMessageToSession,
+		sessionId,
+		setRuntimeErrorMessage,
+		onUserMessageSubmitted,
+	]);
 
 	const handleStop = useCallback(
 		async (event: React.MouseEvent) => {
 			event.preventDefault();
-			clearRuntimeError();
-			await commands.stop();
-			posthog.capture("chat_turn_aborted", {
-				workspace_id: workspaceId,
-				session_id: sessionId,
-				organization_id: organizationId,
-				model_id: activeModel?.id ?? null,
-			});
+			await stopActiveResponse();
 		},
-		[
-			activeModel?.id,
-			clearRuntimeError,
-			commands,
-			organizationId,
-			sessionId,
-			workspaceId,
-		],
+		[stopActiveResponse],
 	);
 
 	const handleSlashCommandSend = useCallback(
 		(command: SlashCommand) => {
-			void handleSend({ text: `/${command.name}`, files: [] });
+			void handleSend({ content: `/${command.name}` }).catch((error) => {
+				console.debug("[chat-mastra] handleSlashCommandSend error", error);
+			});
 		},
 		[handleSend],
 	);
+	const handleApprovalResponse = useCallback(
+		async (decision: "approve" | "decline" | "always_allow_category") => {
+			if (!pendingApproval?.toolCallId) return;
+			clearRuntimeError();
+			setApprovalResponsePending(true);
+			try {
+				await commands.respondToApproval({
+					payload: { decision },
+				});
+			} finally {
+				setApprovalResponsePending(false);
+			}
+		},
+		[clearRuntimeError, commands, pendingApproval?.toolCallId],
+	);
+	const handlePlanResponse = useCallback(
+		async (response: {
+			action: "approved" | "rejected";
+			feedback?: string;
+		}) => {
+			if (!pendingPlanApproval?.planId) return;
+			clearRuntimeError();
+			setPlanResponsePending(true);
+			try {
+				const feedback = response.feedback?.trim();
+				await commands.respondToPlan({
+					payload: {
+						planId: pendingPlanApproval.planId,
+						response: {
+							action: response.action,
+							...(feedback ? { feedback } : {}),
+						},
+					},
+				});
+			} finally {
+				setPlanResponsePending(false);
+			}
+		},
+		[clearRuntimeError, commands, pendingPlanApproval?.planId],
+	);
+	const handleQuestionResponse = useCallback(
+		async (questionId: string, answer: string) => {
+			const trimmedQuestionId = questionId.trim();
+			const trimmedAnswer = answer.trim();
+			if (!trimmedQuestionId || !trimmedAnswer) return;
+			clearRuntimeError();
+			setQuestionResponsePending(true);
+			try {
+				await commands.respondToQuestion({
+					payload: {
+						questionId: trimmedQuestionId,
+						answer: trimmedAnswer,
+					},
+				});
+			} finally {
+				setQuestionResponsePending(false);
+			}
+		},
+		[clearRuntimeError, commands],
+	);
 
 	const errorMessage = runtimeError ?? toErrorMessage(error);
-	const mergedMessages = useMemo(() => messages, [messages]);
+	const isAwaitingAssistant =
+		isRunning || submitStatus === "submitted" || submitStatus === "streaming";
 
 	return (
 		<PromptInputProvider>
 			<div className="flex h-full flex-col bg-background">
 				<ChatMastraMessageList
-					messages={mergedMessages}
+					messages={visibleMessages}
+					isFocused={isFocused}
 					isRunning={canAbort}
+					isConversationLoading={isConversationLoading}
+					isAwaitingAssistant={isAwaitingAssistant}
 					currentMessage={currentMessage ?? null}
+					interruptedMessage={interruptedMessage}
 					workspaceId={workspaceId}
 					sessionId={sessionId}
 					organizationId={organizationId}
 					workspaceCwd={cwd}
 					activeTools={activeTools}
 					toolInputBuffers={toolInputBuffers}
+					activeSubagents={activeSubagents}
+					pendingApproval={pendingApproval}
+					isApprovalSubmitting={approvalResponsePending}
+					onApprovalRespond={handleApprovalResponse}
+					pendingPlanApproval={pendingPlanApproval}
+					isPlanSubmitting={planResponsePending}
+					onPlanRespond={handlePlanResponse}
+					pendingQuestion={pendingQuestion}
+					isQuestionSubmitting={questionResponsePending}
+					onQuestionRespond={handleQuestionResponse}
 				/>
 				<McpControls mcpUi={mcpUi} />
-				<ChatInputFooter
+				<MastraUploadFooter
 					cwd={cwd}
+					isFocused={isFocused}
 					error={errorMessage}
 					canAbort={canAbort}
 					submitStatus={submitStatus}
@@ -345,13 +888,10 @@ export function ChatMastraInterface({
 					thinkingEnabled={thinkingEnabled}
 					setThinkingEnabled={setThinkingEnabled}
 					slashCommands={slashCommands}
-					onSend={(message) => {
-						void handleSend(message);
-					}}
+					sessionId={sessionId}
+					onError={setRuntimeErrorMessage}
+					onSend={handleSend}
 					onSubmitStart={() => setSubmitStatus("submitted")}
-					onSubmitEnd={() => {
-						if (!canAbort) setSubmitStatus(undefined);
-					}}
 					onStop={handleStop}
 					onSlashCommandSend={handleSlashCommandSend}
 				/>
