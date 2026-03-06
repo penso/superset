@@ -95,6 +95,40 @@ export const workspaceTypeSchema = z.enum(["worktree", "branch"]);
 export type WorkspaceType = z.infer<typeof workspaceTypeSchema>;
 
 /**
+ * Workspace execution mode
+ */
+export enum WorkspaceExecutionModeEnum {
+	Local = "local",
+	RemoteSsh = "remote-ssh",
+}
+
+export const workspaceExecutionModeSchema = z.enum([
+	WorkspaceExecutionModeEnum.Local,
+	WorkspaceExecutionModeEnum.RemoteSsh,
+]);
+
+export type WorkspaceExecutionMode = z.infer<
+	typeof workspaceExecutionModeSchema
+>;
+
+/**
+ * Remote transport options for remote-ssh workspaces
+ */
+export enum RemoteWorkspaceTransportEnum {
+	Ssh = "ssh",
+	Mosh = "mosh",
+}
+
+export const remoteWorkspaceTransportSchema = z.enum([
+	RemoteWorkspaceTransportEnum.Ssh,
+	RemoteWorkspaceTransportEnum.Mosh,
+]);
+
+export type RemoteWorkspaceTransport = z.infer<
+	typeof remoteWorkspaceTransportSchema
+>;
+
+/**
  * External apps that can be opened
  */
 export const EXTERNAL_APPS = [

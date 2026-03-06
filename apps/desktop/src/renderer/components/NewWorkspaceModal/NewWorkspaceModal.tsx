@@ -1,3 +1,7 @@
+import type {
+	RemoteWorkspaceTransport,
+	WorkspaceExecutionMode,
+} from "@superset/local-db/schema/zod";
 import {
 	AGENT_PRESET_COMMANDS,
 	buildAgentPromptCommand,
@@ -25,6 +29,10 @@ import {
 	resolveBranchPrefix,
 	sanitizeBranchNameWithMaxLength,
 } from "shared/utils/branch";
+import {
+	RemoteWorkspaceTransportEnum,
+	WorkspaceExecutionModeEnum,
+} from "shared/workspace-execution-mode";
 import type { ImportSourceTab } from "./components/ExistingWorktreesList";
 import { ImportFlow } from "./components/ImportFlow";
 import { NewWorkspaceAdvancedOptions } from "./components/NewWorkspaceAdvancedOptions";
@@ -55,6 +63,16 @@ export function NewWorkspaceModal() {
 	const [branchSearch, setBranchSearch] = useState("");
 	const [showAdvanced, setShowAdvanced] = useState(false);
 	const [runSetupScript, setRunSetupScript] = useState(true);
+	const [executionMode, setExecutionMode] = useState<WorkspaceExecutionMode>(
+		WorkspaceExecutionModeEnum.Local,
+	);
+	const [remoteHost, setRemoteHost] = useState("");
+	const [remoteUser, setRemoteUser] = useState("");
+	const [remotePort, setRemotePort] = useState("");
+	const [remoteRepoPath, setRemoteRepoPath] = useState("");
+	const [remoteTransport, setRemoteTransport] =
+		useState<RemoteWorkspaceTransport>(RemoteWorkspaceTransportEnum.Ssh);
+	const [remoteUseSshfs, setRemoteUseSshfs] = useState(false);
 	const [importTab, setImportTab] = useState<ImportSourceTab>("pull-request");
 	const [selectedAgent, setSelectedAgent] = useState<WorkspaceCreateAgent>(
 		() => {
@@ -180,6 +198,13 @@ export function NewWorkspaceModal() {
 		setBranchSearch("");
 		setShowAdvanced(false);
 		setRunSetupScript(true);
+		setExecutionMode(WorkspaceExecutionModeEnum.Local);
+		setRemoteHost("");
+		setRemoteUser("");
+		setRemotePort("");
+		setRemoteRepoPath("");
+		setRemoteTransport(RemoteWorkspaceTransportEnum.Ssh);
+		setRemoteUseSshfs(false);
 	};
 
 	useEffect(() => {
@@ -251,6 +276,21 @@ export function NewWorkspaceModal() {
 	const selectedProject = recentProjects.find(
 		(p) => p.id === selectedProjectId,
 	);
+	const remoteHostTrimmed = remoteHost.trim();
+	const remoteUserTrimmed = remoteUser.trim();
+	const remoteRepoPathTrimmed = remoteRepoPath.trim();
+	const parsedRemotePort = remotePort.trim()
+		? Number.parseInt(remotePort, 10)
+		: null;
+	const isRemotePortInvalid =
+		remotePort.trim().length > 0 &&
+		(!Number.isInteger(parsedRemotePort) ||
+			(parsedRemotePort !== null && parsedRemotePort < 1) ||
+			(parsedRemotePort !== null && parsedRemotePort > 65535));
+	const isRemoteConfigInvalid =
+		executionMode === WorkspaceExecutionModeEnum.RemoteSsh &&
+		(!remoteHostTrimmed || !remoteRepoPathTrimmed || isRemotePortInvalid);
+
 	const projectSelector = (
 		<ProjectSelector
 			selectedProjectId={selectedProjectId}
@@ -260,7 +300,8 @@ export function NewWorkspaceModal() {
 			onImportRepo={handleImportRepo}
 		/>
 	);
-	const isCreateDisabled = createWorkspace.isPending || isBranchesError;
+	const isCreateDisabled =
+		createWorkspace.isPending || isBranchesError || isRemoteConfigInvalid;
 	const buildLaunchRequestForWorkspace = (
 		workspaceId: string,
 		prompt: string,
@@ -308,6 +349,14 @@ export function NewWorkspaceModal() {
 
 	const handleCreateWorkspace = async () => {
 		if (!selectedProjectId) return;
+		if (isRemoteConfigInvalid) {
+			toast.error("Remote workspace configuration is incomplete", {
+				description: isRemotePortInvalid
+					? "Port must be a number between 1 and 65535."
+					: "Remote host and remote repo path are required.",
+			});
+			return;
+		}
 		// Keep the agent prompt uncapped; only trim surrounding whitespace.
 		const prompt = title.trim();
 
@@ -328,6 +377,32 @@ export function NewWorkspaceModal() {
 					branchName: branchSlug || undefined,
 					baseBranch: baseBranch || undefined,
 					applyPrefix,
+					executionMode,
+					remoteHost:
+						executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+							? remoteHostTrimmed
+							: undefined,
+					remoteUser:
+						executionMode === WorkspaceExecutionModeEnum.RemoteSsh &&
+						remoteUserTrimmed
+							? remoteUserTrimmed
+							: undefined,
+					remotePort:
+						executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+							? (parsedRemotePort ?? undefined)
+							: undefined,
+					remoteRepoPath:
+						executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+							? remoteRepoPathTrimmed
+							: undefined,
+					remoteTransport:
+						executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+							? remoteTransport
+							: undefined,
+					remoteUseSshfs:
+						executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+							? remoteUseSshfs
+							: undefined,
 				},
 				launchRequestTemplate
 					? { agentLaunchRequest: launchRequestTemplate }
@@ -404,6 +479,20 @@ export function NewWorkspaceModal() {
 			onSelectBaseBranch={handleBaseBranchSelect}
 			runSetupScript={runSetupScript}
 			onRunSetupScriptChange={setRunSetupScript}
+			executionMode={executionMode}
+			onExecutionModeChange={setExecutionMode}
+			remoteHost={remoteHost}
+			onRemoteHostChange={setRemoteHost}
+			remoteUser={remoteUser}
+			onRemoteUserChange={setRemoteUser}
+			remotePort={remotePort}
+			onRemotePortChange={setRemotePort}
+			remoteRepoPath={remoteRepoPath}
+			onRemoteRepoPathChange={setRemoteRepoPath}
+			remoteTransport={remoteTransport}
+			onRemoteTransportChange={setRemoteTransport}
+			remoteUseSshfs={remoteUseSshfs}
+			onRemoteUseSshfsChange={setRemoteUseSshfs}
 		/>
 	);
 

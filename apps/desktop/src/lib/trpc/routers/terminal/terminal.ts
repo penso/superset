@@ -11,6 +11,7 @@ import {
 } from "main/lib/terminal/errors";
 import { getTerminalHostClient } from "main/lib/terminal-host/client";
 import { getWorkspaceRuntimeRegistry } from "main/lib/workspace-runtime";
+import { isRemoteSshExecutionMode } from "shared/workspace-execution-mode";
 import { z } from "zod";
 import { publicProcedure, router } from "../..";
 import { assertWorkspaceUsable } from "../workspaces/utils/usability";
@@ -47,11 +48,32 @@ const SAFE_ID = z
  */
 export const createTerminalRouter = () => {
 	const registry = getWorkspaceRuntimeRegistry();
-	const terminal = registry.getDefault().terminal;
+	const defaultTerminal = registry.getDefault().terminal;
+	const paneWorkspaceIds = new Map<string, string>();
+
+	const setPaneWorkspaceId = (paneId: string, workspaceId: string) => {
+		paneWorkspaceIds.set(paneId, workspaceId);
+	};
+
+	const clearPaneWorkspaceId = (paneId: string) => {
+		paneWorkspaceIds.delete(paneId);
+	};
+
+	const getTerminalForWorkspaceId = (workspaceId: string) =>
+		registry.getForWorkspaceId(workspaceId).terminal;
+
+	const getTerminalForPaneId = (paneId: string) => {
+		const workspaceId = paneWorkspaceIds.get(paneId);
+		if (!workspaceId) {
+			return defaultTerminal;
+		}
+		return getTerminalForWorkspaceId(workspaceId);
+	};
+
 	if (DEBUG_TERMINAL) {
 		console.log(
 			"[Terminal Router] Using terminal runtime, capabilities:",
-			terminal.capabilities,
+			defaultTerminal.capabilities,
 		);
 	}
 
@@ -121,6 +143,7 @@ export const createTerminalRouter = () => {
 					requestedThemeType: themeType,
 					persistedThemeState: appState.data.themeState,
 				});
+				const terminal = getTerminalForWorkspaceId(workspaceId);
 
 				try {
 					const result = await terminal.createOrAttach({
@@ -137,6 +160,7 @@ export const createTerminalRouter = () => {
 						allowKilled,
 						themeType: resolvedThemeType,
 					});
+					setPaneWorkspaceId(paneId, workspaceId);
 
 					if (DEBUG_TERMINAL) {
 						console.log("[Terminal Router] createOrAttach result:", {
@@ -202,6 +226,7 @@ export const createTerminalRouter = () => {
 			)
 			.mutation(async ({ input }) => {
 				const shouldThrow = input.throwOnError ?? false;
+				const terminal = getTerminalForPaneId(input.paneId);
 				try {
 					terminal.write(input);
 				} catch (error) {
@@ -236,6 +261,7 @@ export const createTerminalRouter = () => {
 		ackColdRestore: publicProcedure
 			.input(z.object({ paneId: z.string() }))
 			.mutation(({ input }) => {
+				const terminal = getTerminalForPaneId(input.paneId);
 				terminal.ackColdRestore(input.paneId);
 			}),
 
@@ -249,6 +275,7 @@ export const createTerminalRouter = () => {
 				}),
 			)
 			.mutation(async ({ input }) => {
+				const terminal = getTerminalForPaneId(input.paneId);
 				terminal.resize(input);
 			}),
 
@@ -260,6 +287,7 @@ export const createTerminalRouter = () => {
 				}),
 			)
 			.mutation(async ({ input }) => {
+				const terminal = getTerminalForPaneId(input.paneId);
 				terminal.signal(input);
 			}),
 
@@ -270,7 +298,9 @@ export const createTerminalRouter = () => {
 				}),
 			)
 			.mutation(async ({ input }) => {
+				const terminal = getTerminalForPaneId(input.paneId);
 				await terminal.kill(input);
+				clearPaneWorkspaceId(input.paneId);
 			}),
 
 		detach: publicProcedure
@@ -280,6 +310,7 @@ export const createTerminalRouter = () => {
 				}),
 			)
 			.mutation(async ({ input }) => {
+				const terminal = getTerminalForPaneId(input.paneId);
 				terminal.detach(input);
 			}),
 
@@ -290,17 +321,18 @@ export const createTerminalRouter = () => {
 				}),
 			)
 			.mutation(async ({ input }) => {
+				const terminal = getTerminalForPaneId(input.paneId);
 				await terminal.clearScrollback(input);
 			}),
 
 		listDaemonSessions: publicProcedure.query(async () => {
-			const { sessions } = await terminal.management.listSessions();
+			const { sessions } = await defaultTerminal.management.listSessions();
 			return { sessions };
 		}),
 
 		killAllDaemonSessions: publicProcedure.mutation(async () => {
 			const client = getTerminalHostClient();
-			const before = await terminal.management.listSessions();
+			const before = await defaultTerminal.management.listSessions();
 			const beforeIds = before.sessions.map((s) => s.sessionId);
 			console.log(
 				"[killAllDaemonSessions] Before kill:",
@@ -311,7 +343,7 @@ export const createTerminalRouter = () => {
 
 			if (beforeIds.length > 0) {
 				const results = await Promise.allSettled(
-					beforeIds.map((paneId) => terminal.kill({ paneId })),
+					beforeIds.map((paneId) => defaultTerminal.kill({ paneId })),
 				);
 				for (const [index, result] of results.entries()) {
 					if (result.status === "rejected") {
@@ -365,7 +397,8 @@ export const createTerminalRouter = () => {
 		killDaemonSessionsForWorkspace: publicProcedure
 			.input(z.object({ workspaceId: z.string() }))
 			.mutation(async ({ input }) => {
-				const { sessions } = await terminal.management.listSessions();
+				const workspaceTerminal = getTerminalForWorkspaceId(input.workspaceId);
+				const { sessions } = await workspaceTerminal.management.listSessions();
 				const toKill = sessions.filter(
 					(session) => session.workspaceId === input.workspaceId,
 				);
@@ -373,7 +406,7 @@ export const createTerminalRouter = () => {
 				if (toKill.length > 0) {
 					const paneIds = toKill.map((session) => session.sessionId);
 					const results = await Promise.allSettled(
-						paneIds.map((paneId) => terminal.kill({ paneId })),
+						paneIds.map((paneId) => workspaceTerminal.kill({ paneId })),
 					);
 					for (const [index, result] of results.entries()) {
 						if (result.status === "rejected") {
@@ -394,7 +427,7 @@ export const createTerminalRouter = () => {
 			}),
 
 		clearTerminalHistory: publicProcedure.mutation(async () => {
-			await terminal.management.resetHistoryPersistence();
+			await defaultTerminal.management.resetHistoryPersistence();
 			return { success: true };
 		}),
 
@@ -406,6 +439,7 @@ export const createTerminalRouter = () => {
 		getSession: publicProcedure
 			.input(z.string())
 			.query(async ({ input: paneId }) => {
+				const terminal = getTerminalForPaneId(paneId);
 				return terminal.getSession(paneId);
 			}),
 
@@ -422,6 +456,9 @@ export const createTerminalRouter = () => {
 				}
 
 				if (!workspace.worktreeId) {
+					return null;
+				}
+				if (isRemoteSshExecutionMode(workspace.executionMode)) {
 					return null;
 				}
 
@@ -447,6 +484,7 @@ export const createTerminalRouter = () => {
 					| { type: "disconnect"; reason: string }
 					| { type: "error"; error: string; code?: string }
 				>((emit) => {
+					const terminal = getTerminalForPaneId(paneId);
 					if (DEBUG_TERMINAL) {
 						console.log(`[Terminal Stream] Subscribe: ${paneId}`);
 					}

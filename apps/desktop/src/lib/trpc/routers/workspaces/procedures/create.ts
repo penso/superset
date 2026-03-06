@@ -1,4 +1,12 @@
 import { projects, settings, workspaces, worktrees } from "@superset/local-db";
+import {
+	type RemoteWorkspaceTransport,
+	RemoteWorkspaceTransportEnum,
+	remoteWorkspaceTransportSchema,
+	type WorkspaceExecutionMode,
+	WorkspaceExecutionModeEnum,
+	workspaceExecutionModeSchema,
+} from "@superset/local-db/schema/zod";
 import { and, eq, isNull, not } from "drizzle-orm";
 import { track } from "main/lib/analytics";
 import { localDb } from "main/lib/local-db";
@@ -15,6 +23,7 @@ import {
 	getBranchWorkspace,
 	getMaxWorkspaceTabOrder,
 	getProject,
+	getWorkspace,
 	getWorktree,
 	setLastActiveWorkspace,
 	touchWorkspace,
@@ -45,6 +54,13 @@ interface CreateWorkspaceFromWorktreeParams {
 	worktreeId: string;
 	branch: string;
 	name: string;
+	executionMode?: WorkspaceExecutionMode;
+	remoteHost?: string | null;
+	remoteUser?: string | null;
+	remotePort?: number | null;
+	remoteRepoPath?: string | null;
+	remoteTransport?: RemoteWorkspaceTransport | null;
+	remoteUseSshfs?: boolean;
 }
 
 function createWorkspaceFromWorktree({
@@ -52,6 +68,13 @@ function createWorkspaceFromWorktree({
 	worktreeId,
 	branch,
 	name,
+	executionMode = WorkspaceExecutionModeEnum.Local,
+	remoteHost = null,
+	remoteUser = null,
+	remotePort = null,
+	remoteRepoPath = null,
+	remoteTransport = null,
+	remoteUseSshfs = false,
 }: CreateWorkspaceFromWorktreeParams) {
 	const maxTabOrder = getMaxWorkspaceTabOrder(projectId);
 
@@ -64,6 +87,13 @@ function createWorkspaceFromWorktree({
 			branch,
 			name,
 			tabOrder: maxTabOrder + 1,
+			executionMode,
+			remoteHost,
+			remoteUser,
+			remotePort,
+			remoteRepoPath,
+			remoteTransport,
+			remoteUseSshfs,
 		})
 		.returning()
 		.get();
@@ -295,6 +325,13 @@ export const createCreateProcedures = () => {
 					baseBranch: z.string().optional(),
 					useExistingBranch: z.boolean().optional(),
 					applyPrefix: z.boolean().optional().default(true),
+					executionMode: workspaceExecutionModeSchema.optional(),
+					remoteHost: z.string().optional(),
+					remoteUser: z.string().optional(),
+					remotePort: z.number().int().min(1).max(65535).optional(),
+					remoteRepoPath: z.string().optional(),
+					remoteTransport: remoteWorkspaceTransportSchema.optional(),
+					remoteUseSshfs: z.boolean().optional(),
 				}),
 			)
 			.mutation(async ({ input }) => {
@@ -305,6 +342,29 @@ export const createCreateProcedures = () => {
 					.get();
 				if (!project) {
 					throw new Error(`Project ${input.projectId} not found`);
+				}
+
+				const executionMode =
+					input.executionMode ?? WorkspaceExecutionModeEnum.Local;
+				const remoteHost = input.remoteHost?.trim() || null;
+				const remoteUser = input.remoteUser?.trim() || null;
+				const remotePort = input.remotePort ?? null;
+				const remoteRepoPath = input.remoteRepoPath?.trim() || null;
+				const remoteTransport =
+					input.remoteTransport ?? RemoteWorkspaceTransportEnum.Ssh;
+				const remoteUseSshfs = input.remoteUseSshfs ?? false;
+
+				if (executionMode === WorkspaceExecutionModeEnum.RemoteSsh) {
+					if (!remoteHost) {
+						throw new Error(
+							'Remote host is required when execution mode is "remote-ssh"',
+						);
+					}
+					if (!remoteRepoPath) {
+						throw new Error(
+							'Remote repository path is required when execution mode is "remote-ssh"',
+						);
+					}
 				}
 
 				let existingBranchName: string | undefined;
@@ -388,11 +448,49 @@ export const createCreateProcedures = () => {
 						branch,
 					});
 					if (existing) {
+						localDb
+							.update(workspaces)
+							.set({
+								executionMode,
+								remoteHost:
+									executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+										? remoteHost
+										: null,
+								remoteUser:
+									executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+										? remoteUser
+										: null,
+								remotePort:
+									executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+										? remotePort
+										: null,
+								remoteRepoPath:
+									executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+										? remoteRepoPath
+										: null,
+								remoteTransport:
+									executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+										? remoteTransport
+										: null,
+								remoteUseSshfs:
+									executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+										? remoteUseSshfs
+										: false,
+							})
+							.where(eq(workspaces.id, existing.workspace.id))
+							.run();
+
 						touchWorkspace(existing.workspace.id);
 						setLastActiveWorkspace(existing.workspace.id);
 						activateProject(project);
+						const updatedWorkspace = getWorkspace(existing.workspace.id);
+						if (!updatedWorkspace) {
+							throw new Error(
+								`Workspace ${existing.workspace.id} not found after update`,
+							);
+						}
 						return {
-							workspace: existing.workspace,
+							workspace: updatedWorkspace,
 							initialCommands: null,
 							worktreePath: existing.worktree.path,
 							projectId: project.id,
@@ -411,6 +509,31 @@ export const createCreateProcedures = () => {
 							worktreeId: orphanedWorktree.id,
 							branch,
 							name: input.name ?? branch,
+							executionMode,
+							remoteHost:
+								executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+									? remoteHost
+									: null,
+							remoteUser:
+								executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+									? remoteUser
+									: null,
+							remotePort:
+								executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+									? remotePort
+									: null,
+							remoteRepoPath:
+								executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+									? remoteRepoPath
+									: null,
+							remoteTransport:
+								executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+									? remoteTransport
+									: null,
+							remoteUseSshfs:
+								executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+									? remoteUseSshfs
+									: false,
 						});
 						let autoRenameWarning: string | undefined;
 						try {
@@ -481,6 +604,31 @@ export const createCreateProcedures = () => {
 						name: input.name ?? branch,
 						isUnnamed: !input.name,
 						tabOrder: maxTabOrder + 1,
+						executionMode,
+						remoteHost:
+							executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+								? remoteHost
+								: null,
+						remoteUser:
+							executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+								? remoteUser
+								: null,
+						remotePort:
+							executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+								? remotePort
+								: null,
+						remoteRepoPath:
+							executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+								? remoteRepoPath
+								: null,
+						remoteTransport:
+							executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+								? remoteTransport
+								: null,
+						remoteUseSshfs:
+							executionMode === WorkspaceExecutionModeEnum.RemoteSsh
+								? remoteUseSshfs
+								: false,
 					})
 					.returning()
 					.get();

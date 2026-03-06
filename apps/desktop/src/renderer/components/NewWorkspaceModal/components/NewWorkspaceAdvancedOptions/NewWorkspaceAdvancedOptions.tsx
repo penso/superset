@@ -1,3 +1,7 @@
+import type {
+	RemoteWorkspaceTransport,
+	WorkspaceExecutionMode,
+} from "@superset/local-db/schema/zod";
 import { Button } from "@superset/ui/button";
 import {
 	Collapsible,
@@ -14,6 +18,13 @@ import {
 import { Input } from "@superset/ui/input";
 import { Label } from "@superset/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@superset/ui/popover";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@superset/ui/select";
 import { Switch } from "@superset/ui/switch";
 import { GoGitBranch } from "react-icons/go";
 import {
@@ -23,6 +34,10 @@ import {
 	HiOutlinePencil,
 } from "react-icons/hi2";
 import { formatRelativeTime } from "renderer/lib/formatRelativeTime";
+import {
+	RemoteWorkspaceTransportEnum,
+	WorkspaceExecutionModeEnum,
+} from "shared/workspace-execution-mode";
 
 interface BranchOption {
 	name: string;
@@ -48,6 +63,20 @@ interface NewWorkspaceAdvancedOptionsProps {
 	onSelectBaseBranch: (branchName: string) => void;
 	runSetupScript: boolean;
 	onRunSetupScriptChange: (checked: boolean) => void;
+	executionMode: WorkspaceExecutionMode;
+	onExecutionModeChange: (value: WorkspaceExecutionMode) => void;
+	remoteHost: string;
+	onRemoteHostChange: (value: string) => void;
+	remoteUser: string;
+	onRemoteUserChange: (value: string) => void;
+	remotePort: string;
+	onRemotePortChange: (value: string) => void;
+	remoteRepoPath: string;
+	onRemoteRepoPathChange: (value: string) => void;
+	remoteTransport: RemoteWorkspaceTransport;
+	onRemoteTransportChange: (value: RemoteWorkspaceTransport) => void;
+	remoteUseSshfs: boolean;
+	onRemoteUseSshfsChange: (checked: boolean) => void;
 }
 
 export function NewWorkspaceAdvancedOptions({
@@ -69,7 +98,39 @@ export function NewWorkspaceAdvancedOptions({
 	onSelectBaseBranch,
 	runSetupScript,
 	onRunSetupScriptChange,
+	executionMode,
+	onExecutionModeChange,
+	remoteHost,
+	onRemoteHostChange,
+	remoteUser,
+	onRemoteUserChange,
+	remotePort,
+	onRemotePortChange,
+	remoteRepoPath,
+	onRemoteRepoPathChange,
+	remoteTransport,
+	onRemoteTransportChange,
+	remoteUseSshfs,
+	onRemoteUseSshfsChange,
 }: NewWorkspaceAdvancedOptionsProps) {
+	const handleExecutionModeSelect = (value: string) => {
+		if (
+			value === WorkspaceExecutionModeEnum.Local ||
+			value === WorkspaceExecutionModeEnum.RemoteSsh
+		) {
+			onExecutionModeChange(value);
+		}
+	};
+
+	const handleRemoteTransportSelect = (value: string) => {
+		if (
+			value === RemoteWorkspaceTransportEnum.Ssh ||
+			value === RemoteWorkspaceTransportEnum.Mosh
+		) {
+			onRemoteTransportChange(value);
+		}
+	};
+
 	return (
 		<Collapsible open={showAdvanced} onOpenChange={onShowAdvancedChange}>
 			<CollapsibleTrigger className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors">
@@ -197,6 +258,129 @@ export function NewWorkspaceAdvancedOptions({
 						onCheckedChange={onRunSetupScriptChange}
 					/>
 				</div>
+
+				<div className="space-y-1.5">
+					<span className="text-xs text-muted-foreground">Execution mode</span>
+					<Select
+						value={executionMode}
+						onValueChange={handleExecutionModeSelect}
+					>
+						<SelectTrigger className="h-8">
+							<SelectValue />
+						</SelectTrigger>
+						<SelectContent>
+							<SelectItem value={WorkspaceExecutionModeEnum.Local}>
+								Local
+							</SelectItem>
+							<SelectItem value={WorkspaceExecutionModeEnum.RemoteSsh}>
+								Remote over SSH / Mosh
+							</SelectItem>
+						</SelectContent>
+					</Select>
+				</div>
+
+				{executionMode === WorkspaceExecutionModeEnum.RemoteSsh && (
+					<>
+						<div className="space-y-1.5">
+							<Label
+								htmlFor="remote-host"
+								className="text-xs text-muted-foreground"
+							>
+								Remote host
+							</Label>
+							<Input
+								id="remote-host"
+								className="h-8 text-sm font-mono"
+								placeholder="example.com"
+								value={remoteHost}
+								onChange={(e) => onRemoteHostChange(e.target.value)}
+							/>
+						</div>
+
+						<div className="grid grid-cols-2 gap-2">
+							<div className="space-y-1.5">
+								<Label
+									htmlFor="remote-user"
+									className="text-xs text-muted-foreground"
+								>
+									Remote user
+								</Label>
+								<Input
+									id="remote-user"
+									className="h-8 text-sm font-mono"
+									placeholder="optional"
+									value={remoteUser}
+									onChange={(e) => onRemoteUserChange(e.target.value)}
+								/>
+							</div>
+							<div className="space-y-1.5">
+								<Label
+									htmlFor="remote-port"
+									className="text-xs text-muted-foreground"
+								>
+									Port
+								</Label>
+								<Input
+									id="remote-port"
+									className="h-8 text-sm font-mono"
+									placeholder="22"
+									value={remotePort}
+									onChange={(e) => onRemotePortChange(e.target.value)}
+								/>
+							</div>
+						</div>
+
+						<div className="space-y-1.5">
+							<Label
+								htmlFor="remote-repo-path"
+								className="text-xs text-muted-foreground"
+							>
+								Remote repo path
+							</Label>
+							<Input
+								id="remote-repo-path"
+								className="h-8 text-sm font-mono"
+								placeholder="~/src/repo"
+								value={remoteRepoPath}
+								onChange={(e) => onRemoteRepoPathChange(e.target.value)}
+							/>
+						</div>
+
+						<div className="space-y-1.5">
+							<span className="text-xs text-muted-foreground">Transport</span>
+							<Select
+								value={remoteTransport}
+								onValueChange={handleRemoteTransportSelect}
+							>
+								<SelectTrigger className="h-8">
+									<SelectValue />
+								</SelectTrigger>
+								<SelectContent>
+									<SelectItem value={RemoteWorkspaceTransportEnum.Ssh}>
+										SSH
+									</SelectItem>
+									<SelectItem value={RemoteWorkspaceTransportEnum.Mosh}>
+										Mosh
+									</SelectItem>
+								</SelectContent>
+							</Select>
+						</div>
+
+						<div className="flex items-center justify-between">
+							<Label
+								htmlFor="remote-use-sshfs"
+								className="text-xs text-muted-foreground"
+							>
+								Mount with SSHFS (experimental)
+							</Label>
+							<Switch
+								id="remote-use-sshfs"
+								checked={remoteUseSshfs}
+								onCheckedChange={onRemoteUseSshfsChange}
+							/>
+						</div>
+					</>
+				)}
 			</CollapsibleContent>
 		</Collapsible>
 	);
